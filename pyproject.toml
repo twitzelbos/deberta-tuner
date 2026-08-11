@@ -1,0 +1,34 @@
+[project]
+name = "deberta-tuner"
+version = "1.0.0"
+description = "HTTP service that fine-tunes DeBERTa models on uploaded JSONL data"
+readme = "README.md"
+requires-python = ">=3.12"
+
+dependencies = [
+    # Pinned: this pair is the one combination verified end to end. transformers
+    # >=5 also changed checkpoint dtype handling, which the training code
+    # compensates for -- see docs/development.md.
+    "torch==2.11.0",
+    "transformers==5.12.1",
+    "accelerate",
+    # DeBERTa-v3 ships a SentencePiece tokenizer; conversion needs protobuf.
+    "sentencepiece",
+    "protobuf",
+    "fastapi",
+    "uvicorn[standard]",
+    "python-multipart",
+    "pydantic>=2",
+    "scikit-learn",
+    "seqeval",
+    "numpy",
+]
+
+[dependency-groups]
+# httpx backs fastapi.testclient.TestClient, used by tests/test_api.py.
+dev = ["httpx"]
+
+[tool.uv]
+# Not an installable distribution: the service runs from a source checkout with
+# WorkingDirectory set, so `uv sync` should install dependencies only.
+package = false

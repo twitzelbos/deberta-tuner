@@ -1,0 +1,20 @@
+# Virtual environment — rebuild with `uv sync`
+.venv/
+
+# Local service state: job database, uploads, logs, trained models
+state/
+*.db
+*.db-wal
+*.db-shm
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Optional staged uv binary (~51 MB) for hosts where root cannot read a
+# user-local uv. Provide it locally if you need it; never commit it.
+deploy/uv

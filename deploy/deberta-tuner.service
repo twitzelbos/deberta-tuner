@@ -1,0 +1,46 @@
+[Unit]
+Description=DeBERTa fine-tuning service on qgpu1
+After=network-online.target
+Wants=network-online.target
+# No dependency on sglang.service: this unit stops and starts that one, so a
+# hard ordering dependency would deadlock. It must also survive sglang failing.
+
+[Service]
+Type=exec
+User=deberta
+Group=deberta
+WorkingDirectory=/opt/deberta-tuner
+
+# Same lesson as the sglang unit: invoking the venv binary by absolute path does
+# not put its bin/ on PATH, and torch extensions shell out to nvcc.
+Environment=PATH=/opt/deberta-tuner/.venv/bin:/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=CUDA_HOME=/usr/local/cuda
+Environment=TUNER_STATE_DIR=/var/lib/deberta-tuner
+Environment=HF_HOME=/var/lib/deberta-tuner/hf-cache
+Environment=TUNER_HOST=0.0.0.0
+Environment=TUNER_PORT=8100
+Environment=TUNER_SGLANG_UNIT=sglang.service
+Environment=TUNER_SGLANG_CONTROL=1
+
+ExecStart=/opt/deberta-tuner/.venv/bin/uvicorn app.main:app \
+    --host ${TUNER_HOST} \
+    --port ${TUNER_PORT} \
+    --timeout-keep-alive 75
+
+Restart=always
+RestartSec=10
+# Training runs in a worker thread; give an in-flight job time to unwind and,
+# critically, to restart sglang in its finally block.
+TimeoutStopSec=300
+
+LimitNOFILE=65536
+
+# NoNewPrivileges is deliberately NOT set: this service calls `sudo systemctl`
+# to stop/start sglang, and NoNewPrivileges would block setuid sudo outright.
+ProtectSystem=full
+ProtectHome=yes
+PrivateTmp=yes
+ReadWritePaths=/var/lib/deberta-tuner
+
+[Install]
+WantedBy=multi-user.target
