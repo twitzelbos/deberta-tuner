@@ -36,6 +36,7 @@ python -m tests.test_queue                   # seconds: priority, preemption, re
 python -m tests.test_gpu_arbitration         # ~20s: co-tenant hold and idle restart
 TUNER_FORCE_CPU=1 python -m tests.smoke      # ~3 min: all 4 tasks, real weights
 python -m tests.test_resume                  # ~4 min: checkpoint, resume, preempt
+python -m tests.test_reinit_head             # ~2 min: NLI head adaptation
 python -m tests.test_api                     # ~4 min: 28 checks over HTTP
 ```
 
