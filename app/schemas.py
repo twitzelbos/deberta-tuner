@@ -79,6 +79,12 @@ class JobConfig(BaseModel):
     checkpoint_every_epochs: int = Field(default=1, ge=0, le=100)
     # Higher priority preempts lower at the next epoch boundary.
     priority: Priority = Priority.NORMAL
+    # Allow the classification head to be reinitialised when the base model
+    # already has one of a different size -- e.g. fine-tuning a 3-class NLI
+    # checkpoint onto a 2-label task. The encoder still loads normally; only
+    # the head is rebuilt. Off by default so a genuinely wrong base still
+    # fails loudly instead of silently randomising weights.
+    reinit_head: bool = False
 
     @field_validator("base_model")
     @classmethod

@@ -31,6 +31,41 @@ IGNORE_INDEX = -100
 CHECKPOINT_FILE = "checkpoint.pt"
 
 
+# Tensors that may legitimately be rebuilt when adapting a checkpoint to a new
+# label set. Anything else mismatching means the base is not compatible -- a
+# different hidden size or architecture -- and silently randomising it would
+# train a subtly broken model rather than fail.
+HEAD_PREFIXES = ("classifier", "pooler", "score")
+
+
+def _check_load_report(info: dict | None, base_model: str, log) -> None:
+    """Log what `from_pretrained` rebuilt, and refuse anything beyond the head.
+
+    `reinit_head` exists to rebuild a classification head, not to paper over a
+    wrong base model. Scoping the relaxation here keeps the loud failure for
+    every case it was protecting.
+    """
+    if not info:
+        return
+
+    missing = sorted(info.get("missing_keys") or ())
+    mismatched = sorted(k[0] for k in (info.get("mismatched_keys") or ()))
+
+    if missing:
+        log(f"newly initialised (absent from the checkpoint): {missing}")
+    if not mismatched:
+        return
+    log(f"reinitialised due to shape mismatch: {mismatched}")
+
+    beyond_head = [k for k in mismatched if not k.startswith(HEAD_PREFIXES)]
+    if beyond_head:
+        raise ValueError(
+            "reinit_head permits rebuilding the classification head only, but "
+            f"these tensors also mismatched: {beyond_head}. That usually means "
+            f"{base_model} is not a compatible base for this task."
+        )
+
+
 class Cancelled(Exception):
     """Raised when a cancel request is observed mid-training."""
 
@@ -311,14 +346,35 @@ def run(
         kwargs["problem_type"] = problem
 
     factory = AutoModelForTokenClassification if is_token else AutoModelForSequenceClassification
+
+    if cfg.reinit_head:
+        # Transfer learning onto a different label set: the encoder loads
+        # normally and only shape-mismatched tensors are rebuilt. Scoped by
+        # _check_load_report below, so this cannot quietly randomise the encoder.
+        kwargs["ignore_mismatched_sizes"] = True
+
+    try:
+        model, load_info = factory.from_pretrained(
+            cfg.base_model, output_loading_info=True, **kwargs
+        )
+    except (RuntimeError, ValueError) as exc:
+        if "mismatch" in str(exc).lower():
+            raise RuntimeError(
+                f"{cfg.base_model} carries a classification head that does not "
+                f"match num_labels={num_labels}. If you mean to fine-tune an "
+                'existing task checkpoint onto a new label set, set '
+                '"reinit_head": true to rebuild just the head.'
+            ) from exc
+        raise
+
+    _check_load_report(load_info, cfg.base_model, log)
+
     # Force fp32 master weights. transformers>=5 loads a checkpoint in its native
     # dtype, and several DeBERTa checkpoints are fp16; the regression head then
     # does logits.to(labels.dtype), so backward pushes a Float grad into a Half
     # tensor and dies with "Found dtype Float but expected Half". fp32 params
     # with bf16 autocast is also the correct AMP setup on GPU.
-    model = factory.from_pretrained(cfg.base_model, **kwargs).to(
-        device=device, dtype=torch.float32
-    )
+    model = model.to(device=device, dtype=torch.float32)
 
     make = _TokenDataset if is_token else _TextDataset
     collate = _make_collate(tok, cfg.task)

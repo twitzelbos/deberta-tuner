@@ -154,6 +154,7 @@ Everything in `config` is optional; defaults shown:
 | `name` | `null` | free-text label to find your job later |
 | `priority` | `normal` | `low`, `normal` or `high` |
 | `checkpoint_every_epochs` | `1` | `0` disables checkpointing and makes the job non-interruptible |
+| `reinit_head` | `false` | set `true` to start from a checkpoint whose head has a different label count |
 
 Available `base_model` values — `GET /v1/base-models`:
 
@@ -166,6 +167,33 @@ Available `base_model` values — `GET /v1/base-models`:
 | `microsoft/mdeberta-v3-base` | 278M | 86M | multilingual (250k vocab) |
 | `microsoft/deberta-base` | 139M | 86M | v1, legacy |
 | `microsoft/deberta-large` | 405M | 304M | v1, legacy |
+| `MoritzLaurer/DeBERTa-v3-base-mnli-fever-anli` | 183M | 86M | NLI-pretrained, 3-class head |
+| `MoritzLaurer/DeBERTa-v3-large-mnli-fever-anli-ling-wanli` | 434M | 304M | NLI-pretrained, 3-class head |
+| `MoritzLaurer/deberta-v3-base-zeroshot-v2.0` | 183M | 86M | zero-shot NLI, 2-class head |
+
+### Starting from an NLI checkpoint
+
+For entailment-shaped work — claim verification, fact checking, RTE — starting
+from an NLI-pretrained base usually beats training a fresh head on
+`deberta-v3-base`, because the encoder already represents entailment.
+
+Those checkpoints carry a **3-class** head (entailment/neutral/contradiction).
+If your task has a different label count, set `reinit_head`:
+
+```bash
+curl -sS -X POST $HOST/v1/jobs \
+  -F 'config={"base_model":"MoritzLaurer/DeBERTa-v3-base-mnli-fever-anli",
+               "task":"sequence_classification","reinit_head":true,"epochs":3}' \
+  -F 'train_file=@train.jsonl'
+```
+
+The encoder transfers in full; only `classifier.weight` and `classifier.bias`
+are rebuilt at your label count, and the job log lists exactly what was
+rebuilt. Without the flag the job fails with an error telling you to set it —
+deliberately, so nobody trains a randomised head unawares.
+
+Sentence-pair data (`text` + `text_pair`) is the natural fit for these bases,
+since that is how they were trained.
 
 DeBERTa-v3 uses a 128k-token vocabulary, so a large share of the total is the
 embedding table. Training speed tracks the **backbone** column; memory tracks
@@ -395,8 +423,14 @@ requests.delete(f"{HOST}/v1/jobs/{job_id}", timeout=30)
 | `422` | malformed multipart request | check you sent `config` and `train_file` |
 
 If a job reaches `failed`, `error` gives the exception and
-`/v1/jobs/{id}/logs` has the full traceback. The usual causes are CUDA
-out-of-memory (lower `batch_size` or `max_length`) and label inconsistencies.
+`/v1/jobs/{id}/logs` has the full traceback. The usual causes:
+
+| Message contains | Cause | Fix |
+|---|---|---|
+| `CUDA out of memory` | job too large for the GPU | halve `batch_size`, then reduce `max_length` |
+| `carries a classification head that does not match` | the base already has a head of a different size | set `"reinit_head": true` — see [above](#starting-from-an-nli-checkpoint) |
+| `permits rebuilding the classification head only` | the base is not architecture-compatible; more than the head mismatched | choose a different `base_model` |
+| label-related errors | inconsistent labels between train and eval | check both files use the same label strings |
 
 ---
 

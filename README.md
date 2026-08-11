@@ -124,7 +124,7 @@ outage rather than one per job. The unit to cycle is configured with
 
 ## Status
 
-Working and tested. Five suites, all passing:
+Working and tested. Six suites, all passing:
 
 - `tests/smoke.py` — all four task types train end to end on CPU and save real
   weights.
@@ -134,8 +134,10 @@ Working and tested. Five suites, all passing:
   recovery.
 - `tests/test_resume.py` — 20 checks on checkpointing, resume and preemption
   against a real training run.
-- `tests/test_gpu_arbitration.py` — 14 checks on holding the GPU across jobs and
+- `tests/test_gpu_arbitration.py` — 15 checks on holding the GPU across jobs and
   restarting the co-tenant after an idle delay.
+- `tests/test_reinit_head.py` — 15 checks on adapting a 3-class NLI checkpoint
+  to a 2-label task.
 
 ## Install
 

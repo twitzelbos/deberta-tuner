@@ -24,6 +24,7 @@ Sent as the JSON `config` part of `POST /v1/jobs`. Every field is optional.
 | `name` | string | `null` | — | free-text label |
 | `checkpoint_every_epochs` | int | `1` | `0`–`100` | `0` disables checkpointing *and* preemption |
 | `priority` | enum | `normal` | `low`/`normal`/`high` | higher preempts lower at an epoch boundary |
+| `reinit_head` | bool | `false` | — | rebuild the classification head when the base already has one of a different size |
 
 Out-of-range values return `400` with the pydantic error array.
 
@@ -55,6 +56,16 @@ resume from it cannot be preempted, so higher-priority work waits for it.
 boundary; the preempted job pauses and resumes once nothing higher is waiting.
 Equal priorities never preempt each other, otherwise two same-priority jobs
 would trade the GPU every epoch and neither would finish.
+
+**`reinit_head`** — set this when starting from a checkpoint that already has a
+classification head of a different size, e.g. adapting a 3-class NLI model to a
+2-label task. The encoder loads normally and only the head is rebuilt.
+
+Left off, such a load fails with a clear error naming the flag, so you cannot
+silently train a randomised head by accident. Even when on, the relaxation is
+scoped: if anything outside the head mismatches, the job fails rather than
+quietly reinitialising part of the encoder. The rebuilt tensors are always
+listed in the job log.
 
 **`base_model`** — allow-listed deliberately. An open field would let any caller
 on the subnet name an arbitrary hub repo, and model loading can execute

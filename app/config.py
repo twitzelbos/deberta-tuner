@@ -50,6 +50,12 @@ ALLOWED_BASE_MODELS = set(
                     "microsoft/mdeberta-v3-base",
                     "microsoft/deberta-base",
                     "microsoft/deberta-large",
+                    # NLI-pretrained heads. Useful starting points for
+                    # entailment-shaped tasks; they carry a 3-class head, so
+                    # a 2-label job needs reinit_head=true.
+                    "MoritzLaurer/DeBERTa-v3-base-mnli-fever-anli",
+                    "MoritzLaurer/DeBERTa-v3-large-mnli-fever-anli-ling-wanli",
+                    "MoritzLaurer/deberta-v3-base-zeroshot-v2.0",
                 ]
             ),
         ).split(","),
