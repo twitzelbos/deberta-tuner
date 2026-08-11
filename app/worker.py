@@ -1,9 +1,14 @@
 """Single-threaded job runner.
 
-One GPU means one job at a time: the worker is deliberately serial. Before
-training it stops the SGLang unit to free ~21.6 GiB of VRAM, and restarts it
-afterwards -- including on failure, so a crashed job never leaves the inference
-endpoint down.
+One GPU means one job at a time: the worker is deliberately serial.
+
+GPU arbitration wraps the whole drain loop rather than each individual job. The
+co-tenant service is stopped on the first claim and stays stopped while work
+keeps arriving; it is only restarted once the queue has been empty for
+GPU_IDLE_RESTART_SECONDS. Restarting between back-to-back jobs would be pure
+waste -- the co-tenant takes minutes to load its model and the next job would
+stop it again, usually mid-load. The restore is guarded by a finally so a crash
+never leaves the co-tenant down.
 """
 from __future__ import annotations
 
@@ -74,6 +79,14 @@ def _unit_exists() -> bool:
     return config.SGLANG_UNIT in r.stdout
 
 
+def _svc_log(msg: str) -> None:
+    """Log a GPU arbitration event to the journal.
+
+    These events span jobs now, so they cannot go in any single job's log.
+    """
+    print(f"{db.now()} [gpu] {msg}", flush=True)
+
+
 def _systemctl(action: str, log) -> bool:
     cmd = ["sudo", "-n", "systemctl", action, config.SGLANG_UNIT]
     r = subprocess.run(cmd, capture_output=True, text=True)
@@ -84,8 +97,11 @@ def _systemctl(action: str, log) -> bool:
     return True
 
 
-def _release_gpu(log) -> bool:
-    """Stop SGLang so the GPU is free. Returns True if we must restart it."""
+def _stop_cotenant(log) -> bool:
+    """Stop the co-tenant service so the GPU is free.
+
+    Returns True if it was actually stopped, meaning we now owe it a restart.
+    """
     if not config.SGLANG_CONTROL:
         log("SGLang control disabled; assuming the GPU is free")
         return False
@@ -108,7 +124,7 @@ def _release_gpu(log) -> bool:
     return True
 
 
-def _restore_gpu(log) -> None:
+def _start_cotenant(log) -> None:
     _systemctl("start", log)
 
 
@@ -138,7 +154,6 @@ def _run_job(job: dict) -> None:
     def log(msg: str) -> None:
         log_file.write(f"{db.now()} {msg}\n")
 
-    restart_needed = False
     try:
         cfg = JobConfig(**job["config"])
         log(f"job {job_id} starting")
@@ -159,9 +174,9 @@ def _run_job(job: dict) -> None:
             num_eval=len(eval_ds) if eval_ds else 0,
         )
 
-        restart_needed = _release_gpu(log)
-        free = gpu_free_mib(log)
-        log(f"GPU free: {free} MiB")
+        # The co-tenant was already stopped by the drain loop, which holds the
+        # GPU across consecutive jobs. Record what we actually got.
+        log(f"GPU free: {gpu_free_mib(log)} MiB")
 
         metrics = training.run(
             train_ds=train_ds,
@@ -226,22 +241,50 @@ def _run_job(job: dict) -> None:
         )
         purge_checkpoint(job_id)
     finally:
-        # Always hand the GPU back, even if training blew up.
-        if restart_needed:
-            try:
-                _restore_gpu(log)
-            except Exception:
-                log("failed to restart SGLang:\n" + traceback.format_exc())
+        # The GPU is handed back by the drain loop, not here: another job may
+        # be waiting and would only have to stop the co-tenant again.
         log_file.close()
 
 
 def _loop() -> None:
-    while not _stop.is_set():
-        job = db.claim_next()
-        if job is None:
+    """Drain the queue, holding the GPU across consecutive jobs."""
+    holding = False       # true once we have stopped the co-tenant
+    idle_since = None     # monotonic timestamp of the first empty poll
+
+    try:
+        while not _stop.is_set():
+            job = db.claim_next()
+
+            if job is not None:
+                idle_since = None
+                if not holding:
+                    holding = _stop_cotenant(_svc_log)
+                _run_job(job)
+                continue
+
+            # Nothing runnable. claim_next() covers both queued and paused
+            # jobs, so an empty result really does mean there is no work --
+            # including no job paused waiting on higher-priority work.
+            if holding:
+                if idle_since is None:
+                    idle_since = time.monotonic()
+                    _svc_log(
+                        "queue empty; restarting the co-tenant in "
+                        f"{config.GPU_IDLE_RESTART_SECONDS}s unless work arrives"
+                    )
+                elif time.monotonic() - idle_since >= config.GPU_IDLE_RESTART_SECONDS:
+                    _start_cotenant(_svc_log)
+                    holding = False
+                    idle_since = None
+
             _stop.wait(2.0)
-            continue
-        _run_job(job)
+    finally:
+        # Shutting down, or the loop died. Either way, give the GPU back.
+        if holding:
+            try:
+                _start_cotenant(_svc_log)
+            except Exception:
+                _svc_log("failed to restart the co-tenant:\n" + traceback.format_exc())
 
 
 def start() -> None:

@@ -33,6 +33,7 @@ failure.
 
 ```bash
 python -m tests.test_queue                   # seconds: priority, preemption, recovery
+python -m tests.test_gpu_arbitration         # ~20s: co-tenant hold and idle restart
 TUNER_FORCE_CPU=1 python -m tests.smoke      # ~3 min: all 4 tasks, real weights
 python -m tests.test_resume                  # ~4 min: checkpoint, resume, preempt
 python -m tests.test_api                     # ~4 min: 28 checks over HTTP
@@ -63,6 +64,13 @@ Priority ordering, preemption predicates, paused-job scheduling and crash
 recovery, driven against the job store. It calls the route functions directly
 rather than through `TestClient`, because the app's lifespan starts the worker
 thread and it would claim the very jobs the assertions are inspecting.
+
+### `tests/test_gpu_arbitration.py`
+
+Stubs out both the trainer and the systemctl calls and drives the real worker
+loop, asserting that consecutive jobs share one co-tenant stop, that a job
+arriving inside the idle window cancels the pending restart, and that stops and
+starts stay balanced across shutdown.
 
 ### `tests/test_resume.py`
 

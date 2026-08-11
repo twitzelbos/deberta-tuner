@@ -132,22 +132,36 @@ Rather than fight for memory, the tuner takes exclusive use of the GPU for the
 duration of a job by cycling the other service's systemd unit
 (`TUNER_SGLANG_UNIT`, default `sglang.service`).
 
-Sequence per job:
+Arbitration wraps the **whole drain loop**, not each individual job, so a run of
+queued jobs costs one stop and one start rather than one pair per job.
 
-1. `_release_gpu()` checks whether the configured unit is installed and active.
-2. If active, `sudo -n systemctl stop <unit>`.
-3. Poll `nvidia-smi` for up to 30 s until free memory exceeds 20 GiB. `systemctl`
-   returns as soon as the process is gone, but the driver takes a moment to
-   reclaim the allocation.
-4. Train.
-5. In a `finally` block, `sudo -n systemctl start <unit>`.
+1. On the first claim, `_stop_cotenant()` checks the unit is installed and
+   active, then `sudo -n systemctl stop <unit>`.
+2. Poll `nvidia-smi` for up to 30 s until free memory exceeds 20 GiB.
+   `systemctl` returns as soon as the process is gone, but the driver takes a
+   moment to reclaim the allocation.
+3. Run jobs back-to-back for as long as any remain runnable. The GPU stays held
+   throughout; no job re-stops anything.
+4. Once the queue is empty, start an idle timer. If it stays empty for
+   `TUNER_GPU_IDLE_RESTART_SECONDS` (default 60), `sudo -n systemctl start
+   <unit>`. Any job arriving inside that window cancels the pending restart.
+5. On shutdown, a `finally` restarts the co-tenant immediately.
 
-The restart lives in `finally` specifically so that a crashed, cancelled or
-failed job never leaves the inference endpoint down.
+**Why the delay exists.** Restarting between back-to-back jobs is pure waste:
+the co-tenant takes minutes to load its model, and `systemctl start` returns as
+soon as the process execs rather than when it is ready — so the next job would
+typically kill it mid-load. The cost of the delay is that the co-tenant stays
+down up to a minute longer after the last job finishes.
 
-`_release_gpu()` returns `True` only if it actually stopped a running unit, so
-the tuner will not start the co-tenant service if it was already stopped when
-the job began.
+The restore lives in a `finally` specifically so that a crash, a cancelled job
+or a dying worker never leaves the inference endpoint down.
+
+`_stop_cotenant()` returns `True` only if it actually stopped a running unit, so
+the tuner never starts a co-tenant it did not stop.
+
+Because these events now span jobs, they are logged to the service journal with
+a `[gpu]` prefix rather than into any single job's `train.log`. Each job still
+records the free VRAM it saw at start.
 
 Set `TUNER_SGLANG_CONTROL=0` to disable all of this — appropriate for
 development, or when nothing else contends for the GPU.

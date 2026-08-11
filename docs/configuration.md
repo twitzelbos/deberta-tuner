@@ -73,6 +73,7 @@ Set in `deploy/deberta-tuner.service`. Changing one means editing the unit,
 | `TUNER_MAX_UPLOAD_MB` | `512` | per-file upload cap |
 | `TUNER_SGLANG_UNIT` | `sglang.service` | unit to stop and start around jobs |
 | `TUNER_SGLANG_CONTROL` | `1` | `0` disables GPU arbitration entirely |
+| `TUNER_GPU_IDLE_RESTART_SECONDS` | `60` | how long the queue must stay empty before the co-tenant is restarted |
 | `TUNER_FORCE_CPU` | `0` | `1` forces CPU even if CUDA is present |
 | `TUNER_ALLOWED_BASE_MODELS` | 7 DeBERTa variants | comma-separated allow-list |
 | `HF_HOME` | user default | where base models are cached |
@@ -85,6 +86,17 @@ The unit sets `TUNER_STATE_DIR=/var/lib/deberta-tuner` and
 Set to `0` when no other service contends for the GPU, or during development.
 With it off the worker assumes the GPU is already free and will OOM if something
 else holds it.
+
+### `TUNER_GPU_IDLE_RESTART_SECONDS`
+
+The co-tenant service is stopped on the first claim and held across
+back-to-back jobs; it is restarted only after the queue has been empty this
+long. Any job arriving inside the window cancels the pending restart.
+
+Raise it if jobs tend to arrive in bursts with gaps, so the co-tenant is not
+cycled needlessly. Lower it if the inference endpoint matters more than tuning
+throughput. `0` restarts as soon as the queue drains, which reproduces the old
+per-job behaviour and its thrash.
 
 ### `TUNER_FORCE_CPU`
 

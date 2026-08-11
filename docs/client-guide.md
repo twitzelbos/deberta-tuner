@@ -17,8 +17,10 @@ No authentication. Anyone on the subnet can submit jobs; be considerate.
    priority. Check `GET /v1/queue` to see where you are.
 2. **Submitting a job may take another service on the same host offline.**
    Training needs the whole GPU, so the server stops any co-tenant GPU service
-   for the duration of your job and restarts it afterwards. Ask your operator
-   what shares the host before running long jobs.
+   while jobs are running. It stays down for as long as the queue has work, plus
+   a short idle delay (60 s by default) before being restarted — so a burst of
+   jobs costs one outage rather than one per job. Ask your operator what shares
+   the host before running long jobs.
 3. **Nothing is deleted automatically.** Delete your job when you have
    downloaded the model.
 

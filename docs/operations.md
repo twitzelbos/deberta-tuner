@@ -100,14 +100,17 @@ journalctl -u deberta-tuner -n 50 --no-pager
 
 ### Jobs fail with CUDA out of memory
 
-Confirm the co-tenant service actually stopped:
+Confirm the co-tenant service actually stopped. Arbitration spans jobs, so the
+stop/start events are in the journal, while each job records the VRAM it saw:
 
 ```bash
-grep -E "systemctl|GPU free" /var/lib/deberta-tuner/jobs/<job_id>/train.log
+journalctl -u deberta-tuner | grep '\[gpu\]'
+grep "GPU free" /var/lib/deberta-tuner/jobs/<job_id>/train.log
 ```
 
-Expect a `systemctl stop ...: ok` line followed by a `GPU free:` figure large
-enough to train. If free memory is still small, arbitration failed — check the sudoers grant and that
+Expect a `systemctl stop ...: ok` line in the journal and a `GPU free:` figure
+in the job log large enough to train. If free memory is still small, arbitration
+failed — check the sudoers grant and that
 `NoNewPrivileges` is not set:
 
 ```bash
@@ -120,7 +123,13 @@ If arbitration works and it still OOMs, the job is genuinely too large: lower
 
 ### The co-tenant service did not come back
 
-The restart is in a `finally`, so this should be rare.
+Give it `TUNER_GPU_IDLE_RESTART_SECONDS` (default 60) first: the co-tenant is
+deliberately held while work remains and for a grace period after the queue
+drains. Beyond that the restart is in a `finally`, so a genuine failure is rare.
+
+```bash
+journalctl -u deberta-tuner | grep '\[gpu\]' | tail
+```
 
 ```bash
 systemctl status sglang

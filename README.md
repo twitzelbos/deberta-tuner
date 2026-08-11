@@ -115,15 +115,16 @@ Training needs the whole GPU. If another service on the same host holds VRAM —
 an LLM inference server, for example — **the tuner stops it for the duration of
 each job** and restarts it afterwards.
 
-That means submitting a tuning job takes the co-tenant service offline for the
-length of the job plus its restart time. The unit to cycle is configured with
+The co-tenant is held for as long as the queue has work, plus a short idle delay
+(`TUNER_GPU_IDLE_RESTART_SECONDS`, default 60 s), so a burst of jobs costs one
+outage rather than one per job. The unit to cycle is configured with
 `TUNER_SGLANG_UNIT`, and the whole behaviour can be disabled with
 `TUNER_SGLANG_CONTROL=0`. See
 [GPU arbitration](docs/architecture.md#gpu-arbitration).
 
 ## Status
 
-Working and tested. Four suites, all passing:
+Working and tested. Five suites, all passing:
 
 - `tests/smoke.py` — all four task types train end to end on CPU and save real
   weights.
@@ -133,6 +134,8 @@ Working and tested. Four suites, all passing:
   recovery.
 - `tests/test_resume.py` — 20 checks on checkpointing, resume and preemption
   against a real training run.
+- `tests/test_gpu_arbitration.py` — 14 checks on holding the GPU across jobs and
+  restarting the co-tenant after an idle delay.
 
 ## Install
 
