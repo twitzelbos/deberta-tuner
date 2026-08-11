@@ -32,7 +32,9 @@ Neither suite needs pytest; both are plain scripts that exit non-zero on
 failure.
 
 ```bash
+python -m tests.test_queue                   # seconds: priority, preemption, recovery
 TUNER_FORCE_CPU=1 python -m tests.smoke      # ~3 min: all 4 tasks, real weights
+python -m tests.test_resume                  # ~4 min: checkpoint, resume, preempt
 python -m tests.test_api                     # ~4 min: 28 checks over HTTP
 ```
 
@@ -55,7 +57,21 @@ validation with line numbers, submit, queue, poll to `succeeded`, metrics,
 artifact download, tar contents, `id2label` persistence, and the lifecycle
 `409`/`404`/`204` paths.
 
-Both write to a fresh `tempfile.mkdtemp()`, so they never touch real state.
+### `tests/test_queue.py`
+
+Priority ordering, preemption predicates, paused-job scheduling and crash
+recovery, driven against the job store. It calls the route functions directly
+rather than through `TestClient`, because the app's lifespan starts the worker
+thread and it would claim the very jobs the assertions are inspecting.
+
+### `tests/test_resume.py`
+
+A real training run interrupted after its first checkpoint, then resumed and
+verified to continue rather than restart; plus preemption yielding at an epoch
+boundary, and the guarantee that `checkpoint_every_epochs: 0` opts out.
+
+All suites write to a fresh `tempfile.mkdtemp()`, so they never touch real
+state.
 
 ## Layout
 

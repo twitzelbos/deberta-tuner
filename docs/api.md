@@ -28,6 +28,7 @@ Liveness plus enough state to decide whether to submit.
   "cuda_available": true,
   "gpu_free_mib": 2470,
   "queued": 0,
+  "paused": 0,
   "running": 0
 }
 ```
@@ -53,6 +54,51 @@ holds most of the VRAM until a job stops it.
 
 Reflects `TUNER_ALLOWED_BASE_MODELS`. Any other `base_model` is rejected with
 `400`.
+
+---
+
+## `GET /v1/queue`
+
+What is running, what is waiting, and in what order.
+
+**200**
+
+```json
+{
+  "running": {
+    "id": "9f2c...", "name": "sentiment-v2", "task": "sequence_classification",
+    "base_model": "microsoft/deberta-v3-base", "priority": "normal",
+    "started_at": "2026-08-11T09:14:03+00:00", "progress": 0.62,
+    "epochs_completed": 1, "elapsed_seconds": 412, "eta_seconds": 252,
+    "yielding": false
+  },
+  "waiting": [
+    {"position": 1, "id": "a1b2...", "status": "paused",  "priority": "normal",
+     "progress": 0.4, "epochs_completed": 2, "preempted_count": 1,
+     "waiting_seconds": 900, "name": null, "task": "sequence_classification",
+     "base_model": "microsoft/deberta-v3-base", "created_at": "..."},
+    {"position": 2, "id": "c3d4...", "status": "queued", "priority": "low",
+     "progress": 0.0, "epochs_completed": 0, "preempted_count": 0,
+     "waiting_seconds": 120, "name": null, "task": "regression",
+     "base_model": "microsoft/deberta-v3-base", "created_at": "..."}
+  ],
+  "queued_count": 1,
+  "paused_count": 1,
+  "concurrency": 1
+}
+```
+
+`waiting` is ordered exactly as the worker will run the jobs: priority
+descending, then oldest first.
+
+| Field | Meaning |
+|---|---|
+| `running.eta_seconds` | straight-line extrapolation from elapsed time and progress; `null` until the first step. Ignores evaluation and saving, so it runs optimistic |
+| `running.yielding` | `true` when higher-priority work is waiting, so this job will pause at its next epoch boundary |
+| `waiting[].status` | `queued` = never started; `paused` = started then preempted or interrupted |
+| `waiting[].progress` | where a paused job stopped and will resume from; `0.0` for never-started jobs |
+| `waiting[].preempted_count` | how many times higher-priority work has bumped this job |
+| `concurrency` | jobs run at once; always `1` |
 
 ---
 
@@ -131,7 +177,8 @@ set, step losses, eval metrics, GPU arbitration results, and any traceback.
 
 ## `POST /v1/jobs/{job_id}/cancel`
 
-- `queued` → immediately `cancelled` (no worker is watching it).
+- `queued` or `paused` → immediately `cancelled`, and any checkpoint is
+  deleted (no worker is watching the flag).
 - `running` → sets a flag; the training loop checks it every step and unwinds
   within seconds. The co-tenant service is still restarted.
 
@@ -195,6 +242,10 @@ Irreversible.
 | `finished_at` | string \| null | terminal timestamp |
 | `progress` | float | 0.0–1.0 |
 | `error` | string \| null | truncated to 2000 chars |
+| `priority` | enum | `low`, `normal`, `high` |
+| `epochs_completed` | int | epochs finished and checkpointed |
+| `queue_position` | int \| null | 1-based; null unless queued or paused |
+| `preempted_count` | int | times bumped by higher-priority work |
 
 ### JobDetail
 
@@ -225,8 +276,9 @@ the only key.
 
 | Status | Terminal | Meaning |
 |---|---|---|
-| `queued` | no | waiting for the worker |
+| `queued` | no | waiting for the worker, never started |
 | `running` | no | training |
+| `paused` | no | started, then preempted by higher-priority work or interrupted by a restart. Retains its checkpoint, `progress` and `epochs_completed`, and resumes when nothing better is waiting |
 | `succeeded` | yes | artifact available |
 | `failed` | yes | see `error` and the log |
 | `cancelled` | yes | cancelled by request |

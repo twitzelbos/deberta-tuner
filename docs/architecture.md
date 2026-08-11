@@ -41,25 +41,84 @@ deliberate — see [why serial](#why-serial).
         v
     [queued] --------- cancel ---------> [cancelled]
         |
-        | worker claims (atomic UPDATE)
+        | worker claims highest priority (atomic UPDATE)
         v
    [running] --------- cancel ---------> [cancelled]
-        |                                (checked once per training step)
+        |  ^                             (checked once per training step)
+        |  |
+        |  +--- claimed again when nothing better is waiting
+        |  |
+        |  v
+        +--> [paused] ---- cancel ------> [cancelled]
+        |     ^  preempted by higher priority, or interrupted by shutdown;
+        |     |  keeps its checkpoint, progress and epochs_completed
+        |
         +----- success ----> [succeeded]  (artifact available)
         |
         +----- exception --> [failed]     (error field populated)
 ```
 
-`succeeded`, `failed` and `cancelled` are terminal.
+`succeeded`, `failed` and `cancelled` are terminal. `queued` and `paused` are
+both *runnable*: the worker claims from either.
 
 Claiming is atomic: the worker does a conditional
-`UPDATE ... WHERE id=? AND status='queued'` and only proceeds if exactly one row
-changed. That makes the design safe if a second worker is ever added.
+`UPDATE ... WHERE id=? AND status IN ('queued','paused')` and only proceeds if
+exactly one row changed. That keeps the design safe if a second worker is ever
+added.
 
-**Crash recovery.** A job can only be `running` while the worker owns it. On
-startup `db.init()` marks any surviving `running` row as `failed` with
-`"service restarted while this job was running"`. There is no checkpoint or
-resume; a job interrupted by a restart must be resubmitted.
+**Crash recovery.** A job can only be `running` while the worker owns it, so a
+surviving `running` row means the process died. At startup
+`worker.recover_interrupted()` reconciles each one:
+
+| Condition | Outcome |
+|---|---|
+| cancel was requested | `cancelled`, checkpoint deleted |
+| a checkpoint exists | `paused` — goes back on the queue and resumes |
+| no checkpoint | `failed`, explaining that nothing was resumable |
+
+## Priority and preemption
+
+Three levels: `low`, `normal` (default) and `high`. The queue is ordered by
+priority descending, then by age, then by id as a deterministic tiebreak. Paused
+jobs compete on equal terms with jobs that have never started, so a paused
+high-priority job still outranks a fresh normal one.
+
+A running job checks for **strictly** higher-priority waiting work at each epoch
+boundary. If it finds any, it writes a checkpoint — even off its normal interval
+— and raises `Preempted`. The worker marks it `paused` and increments
+`preempted_count`; the queue ordering then guarantees it does not run again until
+nothing higher-priority is waiting.
+
+Two consequences worth being explicit about:
+
+- **Strictly higher, never equal.** If equal priorities preempted each other,
+  two same-priority jobs would trade the GPU at every epoch and neither would
+  finish.
+- **A job with `checkpoint_every_epochs: 0` cannot be preempted.** There would be
+  nothing to resume from, so higher-priority work waits for it to finish. This is
+  the one way to make a job non-interruptible.
+
+Preemption is only ever evaluated at an epoch boundary, because that is the only
+point where a checkpoint is coherent. A single very long epoch therefore delays
+preemption until it completes.
+
+## Checkpointing
+
+Granularity is a whole epoch. Resuming restarts the interrupted epoch rather
+than replaying the dataloader to an exact batch, which avoids having to restore
+iteration order and keeps the state small enough to reason about.
+
+A checkpoint holds the model, optimizer and scheduler state, the epoch and step
+counters, the label list and the torch RNG state. It is written to
+`jobs/<id>/checkpoint/checkpoint.pt` via a temporary file and an atomic rename,
+so a crash mid-write can never replace a good checkpoint with a truncated one.
+
+On load, the checkpoint's label list is compared against the current data; a
+mismatch is logged and the checkpoint ignored rather than trusted.
+
+Checkpoints are large — roughly three times the model size, since AdamW keeps
+two moments per parameter — so they are deleted as soon as the job reaches a
+terminal state.
 
 ## GPU arbitration
 

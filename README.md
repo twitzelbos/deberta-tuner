@@ -74,7 +74,12 @@ this project does.
 - **Artifacts are self-describing.** Inferred labels are written into
   `id2label`/`label2id`, so the tarball loads with plain `AutoModelFor*` and no
   side-channel mapping file.
-- **It is small enough to audit.** ~1,200 lines across seven modules, one
+- **Long jobs survive restarts and yield to urgent work.** Epoch-boundary
+  checkpointing means an interrupted job resumes where it stopped, and a
+  three-level priority queue lets a `high` job preempt a running `normal` one at
+  its next checkpoint. The queue is queryable, so callers can see their position
+  and where a paused job stopped.
+- **It is small enough to audit.** ~1,600 lines across seven modules, one
   process, SQLite for state, no broker, no Kubernetes, no container runtime.
 
 ### When to use something else
@@ -88,8 +93,6 @@ Being honest about the gaps — this project has:
 - **No LLM/LoRA support.** Encoders only. Use Axolotl or LLaMA-Factory.
 - **No experiment tracking or UI** beyond job status, logs and the OpenAPI
   browser. No W&B or MLflow integration.
-- **No checkpoint/resume.** A job interrupted by a restart is marked failed and
-  must be resubmitted.
 - **No authentication.** See
   [configuration.md](docs/configuration.md#adding-authentication).
 
@@ -120,12 +123,16 @@ length of the job plus its restart time. The unit to cycle is configured with
 
 ## Status
 
-Working and tested. Two suites, both passing:
+Working and tested. Four suites, all passing:
 
 - `tests/smoke.py` — all four task types train end to end on CPU and save real
   weights.
 - `tests/test_api.py` — 28 checks over the HTTP surface, including a real job
   submitted, polled to completion, and its artifact downloaded and inspected.
+- `tests/test_queue.py` — 35 checks on priority ordering, preemption and crash
+  recovery.
+- `tests/test_resume.py` — 20 checks on checkpointing, resume and preemption
+  against a real training run.
 
 ## Install
 

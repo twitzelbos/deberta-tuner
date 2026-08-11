@@ -145,6 +145,18 @@ gradient into a Half tensor.
 keep the `.to(dtype=torch.float32)`. It was also silently degrading token
 classification — seqeval F1 went 0.0 → 0.67 once fixed.
 
+### A job sits in `paused` and never resumes
+
+Expected while higher-priority work is waiting: a paused job only runs again
+once nothing above it remains. Confirm with the queue view.
+
+```bash
+curl -sS $TUNER_URL/v1/queue | jq '{running: .running.priority, waiting: [.waiting[] | {position, id, status, priority}]}'
+```
+
+If nothing higher-priority is waiting and it still does not resume, the worker
+is not claiming — see the next section.
+
 ### Jobs stuck in `queued`
 
 The worker thread died, or a job ahead is still running.
@@ -166,6 +178,13 @@ Expected after a restart during training, and applied at startup by
 
 Nothing is cleaned up automatically. Each job keeps its uploads, the model
 directory *and* the tarball, so a `deberta-v3-large` job costs roughly 3.5 GB.
+
+A **running or paused** job additionally holds a checkpoint of roughly 3x the
+model size — weights plus the two AdamW moments — so a paused `deberta-v3-large`
+job can occupy ~5 GB on its own. Checkpoints are deleted the moment a job
+reaches a terminal state, including cancellation, so this is transient unless
+jobs sit paused for a long time. A queue with several paused large jobs is the
+realistic way to fill the disk.
 
 ```bash
 du -sh /var/lib/deberta-tuner/jobs/* | sort -h | tail

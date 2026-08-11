@@ -64,14 +64,20 @@ def run_task(task: TaskType, workdir: Path) -> dict:
     labels = data.merge_labels(train_ds, eval_ds)
     print(f"parsed {len(ds)} rows, labels={labels}")
 
+    # Checkpointing off: this suite is about the four task pipelines, and
+    # tests/test_resume.py covers checkpoint/resume/preemption on its own.
     cfg = JobConfig(base_model=BASE, task=task, epochs=1, batch_size=4,
-                    max_length=64, eval_split=0.25)
+                    max_length=64, eval_split=0.25, checkpoint_every_epochs=0)
     metrics = training.run(
         train_ds=train_ds, eval_ds=eval_ds, labels=labels, cfg=cfg,
         out_dir=workdir / task.value / "output",
+        ckpt_dir=workdir / task.value / "checkpoint",
         log=lambda m: print("  " + m, flush=True),
         on_progress=lambda p: None,
+        on_checkpoint=lambda e: None,
         should_cancel=lambda: False,
+        should_stop=lambda: False,
+        should_yield=lambda: False,
     )
 
     out = workdir / task.value / "output"
