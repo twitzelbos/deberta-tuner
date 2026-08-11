@@ -21,6 +21,10 @@ Environment=TUNER_HOST=0.0.0.0
 Environment=TUNER_PORT=8100
 Environment=TUNER_SGLANG_UNIT=sglang.service
 Environment=TUNER_SGLANG_CONTROL=1
+# The co-tenant is stopped on the first job and held across back-to-back jobs;
+# it is restarted only once the queue has been empty this long. Restarting
+# between jobs would be wasted work, since it needs minutes to load its model.
+Environment=TUNER_GPU_IDLE_RESTART_SECONDS=60
 
 ExecStart=/opt/deberta-tuner/.venv/bin/uvicorn app.main:app \
     --host ${TUNER_HOST} \

@@ -22,6 +22,15 @@ MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024
 SGLANG_UNIT = os.environ.get("TUNER_SGLANG_UNIT", "sglang.service")
 SGLANG_CONTROL = os.environ.get("TUNER_SGLANG_CONTROL", "1") == "1"
 
+# How long the queue must stay empty before the co-tenant service is restarted.
+# Restarting it between back-to-back jobs is pure waste: the co-tenant needs
+# minutes to load its model, and the next job would immediately stop it again,
+# usually mid-load. Holding the GPU across a busy stretch avoids that thrash at
+# the cost of leaving the co-tenant down a little longer after the last job.
+GPU_IDLE_RESTART_SECONDS = int(
+    os.environ.get("TUNER_GPU_IDLE_RESTART_SECONDS", "60")
+)
+
 # Force CPU regardless of availability (used by the test suite).
 FORCE_CPU = os.environ.get("TUNER_FORCE_CPU", "0") == "1"
 
