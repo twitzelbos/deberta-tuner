@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import uuid
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 
 from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
@@ -11,7 +12,16 @@ from fastapi.responses import FileResponse, PlainTextResponse
 from pydantic import ValidationError
 
 from . import config, data, db, worker
-from .schemas import JobConfig, JobDetail, JobStatus, JobSummary
+from .schemas import (
+    PRIORITY_RANK,
+    JobConfig,
+    JobDetail,
+    JobStatus,
+    JobSummary,
+    QueuedJob,
+    QueueView,
+    RunningJob,
+)
 
 CHUNK = 1 << 20
 
@@ -20,6 +30,8 @@ CHUNK = 1 << 20
 async def lifespan(app: FastAPI):
     config.ensure_dirs()
     db.init()
+    # Reconcile anything orphaned by the previous shutdown before accepting work.
+    worker.recover_interrupted()
     worker.start()
     yield
     worker.shutdown()
@@ -27,10 +39,23 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="DeBERTa tuning service",
-    version="1.0.0",
+    version="1.1.0",
     description="Submit a JSONL dataset, get back a fine-tuned DeBERTa model.",
     lifespan=lifespan,
 )
+
+
+def _age_seconds(stamp: str | None) -> int:
+    """Whole seconds between an ISO-8601 timestamp and now."""
+    if not stamp:
+        return 0
+    try:
+        then = datetime.fromisoformat(stamp)
+    except ValueError:
+        return 0
+    if then.tzinfo is None:
+        then = then.replace(tzinfo=timezone.utc)
+    return max(0, int((datetime.now(timezone.utc) - then).total_seconds()))
 
 
 def _save_upload(upload: UploadFile, dest: Path) -> int:
@@ -52,6 +77,13 @@ def _save_upload(upload: UploadFile, dest: Path) -> int:
     return total
 
 
+def _detail(job_id: str) -> JobDetail:
+    row = db.get(job_id)
+    if row is None:
+        raise HTTPException(404, f"no such job: {job_id}")
+    return JobDetail(**row, queue_position=db.queue_position(job_id))
+
+
 @app.get("/healthz")
 def healthz() -> dict:
     import torch
@@ -59,8 +91,9 @@ def healthz() -> dict:
     return {
         "status": "ok",
         "cuda_available": torch.cuda.is_available(),
-        "gpu_free_mib": worker._gpu_free_mib(lambda _m: None),
+        "gpu_free_mib": worker.gpu_free_mib(lambda _m: None),
         "queued": len(db.list_jobs(status=JobStatus.QUEUED.value, limit=1000)),
+        "paused": len(db.list_jobs(status=JobStatus.PAUSED.value, limit=1000)),
         "running": len(db.list_jobs(status=JobStatus.RUNNING.value, limit=10)),
     }
 
@@ -68,6 +101,58 @@ def healthz() -> dict:
 @app.get("/v1/base-models")
 def base_models() -> dict:
     return {"base_models": sorted(config.ALLOWED_BASE_MODELS)}
+
+
+@app.get("/v1/queue", response_model=QueueView)
+def get_queue() -> QueueView:
+    """What is running, what is waiting, in what order, and why."""
+    run = db.running_job()
+    running = None
+    if run is not None:
+        elapsed = _age_seconds(run["started_at"])
+        progress = run["progress"] or 0.0
+        # Straight-line extrapolation. Deliberately crude: it ignores evaluation
+        # and model saving, so treat it as a floor rather than a promise.
+        eta = int(elapsed * (1 - progress) / progress) if progress > 0.01 else None
+        running = RunningJob(
+            id=run["id"],
+            name=run["name"],
+            task=run["task"],
+            base_model=run["base_model"],
+            priority=run["priority"],
+            started_at=run["started_at"],
+            progress=progress,
+            epochs_completed=run["epochs_completed"],
+            elapsed_seconds=elapsed,
+            eta_seconds=eta,
+            yielding=db.higher_priority_waiting(PRIORITY_RANK[run["priority"]]),
+        )
+
+    waiting = [
+        QueuedJob(
+            position=i,
+            id=j["id"],
+            name=j["name"],
+            status=j["status"],
+            priority=j["priority"],
+            task=j["task"],
+            base_model=j["base_model"],
+            created_at=j["created_at"],
+            waiting_seconds=_age_seconds(j["created_at"]),
+            # Non-zero for a paused job: where it stopped and will resume from.
+            progress=j["progress"] or 0.0,
+            epochs_completed=j["epochs_completed"],
+            preempted_count=j["preempted_count"],
+        )
+        for i, j in enumerate(db.waiting_jobs(), start=1)
+    ]
+
+    return QueueView(
+        running=running,
+        waiting=waiting,
+        queued_count=sum(1 for j in waiting if j.status is JobStatus.QUEUED),
+        paused_count=sum(1 for j in waiting if j.status is JobStatus.PAUSED),
+    )
 
 
 @app.post("/v1/jobs", response_model=JobDetail, status_code=201)
@@ -96,7 +181,7 @@ def create_job(
 
         # Validate now so the caller gets a 400 immediately, rather than a job
         # that sits in the queue and then fails minutes later.
-        train_ds = data.parse(jdir / "train.jsonl", cfg.task)
+        data.parse(jdir / "train.jsonl", cfg.task)
         if (jdir / "eval.jsonl").exists():
             data.parse(jdir / "eval.jsonl", cfg.task)
     except HTTPException:
@@ -115,19 +200,14 @@ def create_job(
     return _detail(job_id)
 
 
-def _detail(job_id: str) -> JobDetail:
-    row = db.get(job_id)
-    if row is None:
-        raise HTTPException(404, f"no such job: {job_id}")
-    return JobDetail(**row)
-
-
 @app.get("/v1/jobs", response_model=list[JobSummary])
 def list_jobs(
     status: JobStatus | None = None, limit: int = Query(100, ge=1, le=1000)
 ) -> list[JobSummary]:
     rows = db.list_jobs(status=status.value if status else None, limit=limit)
-    return [JobSummary(**r) for r in rows]
+    # Resolve queue positions in one pass rather than a query per row.
+    order = {j["id"]: i for i, j in enumerate(db.waiting_jobs(), start=1)}
+    return [JobSummary(**r, queue_position=order.get(r["id"])) for r in rows]
 
 
 @app.get("/v1/jobs/{job_id}", response_model=JobDetail)
@@ -155,9 +235,11 @@ def cancel_job(job_id: str) -> JobDetail:
     status = JobStatus(row["status"])
     if status.terminal:
         raise HTTPException(409, f"job is already {status.value}")
-    if status is JobStatus.QUEUED:
-        # Never claimed, so there is no loop watching the cancel flag.
+    if status.runnable:
+        # Not executing, so no loop is watching the cancel flag. Drop any
+        # checkpoint too, or a paused job would leave gigabytes behind.
         db.update(job_id, status=JobStatus.CANCELLED, finished_at=db.now())
+        worker.purge_checkpoint(job_id)
     else:
         db.request_cancel(job_id)
     return _detail(job_id)

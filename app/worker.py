@@ -17,7 +17,7 @@ import traceback
 from pathlib import Path
 
 from . import config, data, db, training
-from .schemas import JobConfig, JobStatus, TaskType
+from .schemas import PRIORITY_RANK, JobConfig, JobStatus, TaskType
 
 _stop = threading.Event()
 _thread: threading.Thread | None = None
@@ -25,6 +25,40 @@ _thread: threading.Thread | None = None
 
 def job_dir(job_id: str) -> Path:
     return config.JOBS_DIR / job_id
+
+
+def checkpoint_dir(job_id: str) -> Path:
+    return job_dir(job_id) / "checkpoint"
+
+
+def purge_checkpoint(job_id: str) -> None:
+    """Checkpoints are large (~3x model size); drop them once unneeded."""
+    shutil.rmtree(checkpoint_dir(job_id), ignore_errors=True)
+
+
+def recover_interrupted() -> None:
+    """Reconcile jobs left RUNNING by a crash or restart.
+
+    Called once at startup, before the worker begins. A job with a usable
+    checkpoint goes back on the queue and resumes; one without has nothing to
+    resume from and is failed.
+    """
+    for job in db.interrupted_jobs():
+        job_id = job["id"]
+        has_ckpt = (checkpoint_dir(job_id) / training.CHECKPOINT_FILE).exists()
+        if job.get("cancel_requested"):
+            db.update(job_id, status=JobStatus.CANCELLED, finished_at=db.now())
+            purge_checkpoint(job_id)
+        elif has_ckpt:
+            db.update(job_id, status=JobStatus.PAUSED, started_at=None, error=None)
+        else:
+            db.update(
+                job_id,
+                status=JobStatus.FAILED,
+                finished_at=db.now(),
+                error="service restarted while this job was running, and no "
+                      "checkpoint was available to resume from",
+            )
 
 
 # --------------------------------------------------------------------------- #
@@ -69,7 +103,7 @@ def _release_gpu(log) -> bool:
     # moment to reclaim the allocation.
     for _ in range(30):
         time.sleep(1)
-        if _gpu_free_mib(log) > 20_000:
+        if gpu_free_mib(log) > 20_000:
             break
     return True
 
@@ -78,7 +112,7 @@ def _restore_gpu(log) -> None:
     _systemctl("start", log)
 
 
-def _gpu_free_mib(log) -> int:
+def gpu_free_mib(log) -> int:
     try:
         r = subprocess.run(
             ["nvidia-smi", "--query-gpu=memory.free", "--format=csv,noheader,nounits"],
@@ -126,7 +160,7 @@ def _run_job(job: dict) -> None:
         )
 
         restart_needed = _release_gpu(log)
-        free = _gpu_free_mib(log)
+        free = gpu_free_mib(log)
         log(f"GPU free: {free} MiB")
 
         metrics = training.run(
@@ -135,9 +169,15 @@ def _run_job(job: dict) -> None:
             labels=labels,
             cfg=cfg,
             out_dir=jdir / "output",
+            ckpt_dir=checkpoint_dir(job_id),
             log=log,
             on_progress=lambda p: db.update(job_id, progress=round(p, 4)),
+            on_checkpoint=lambda e: db.update(job_id, epochs_completed=e),
             should_cancel=lambda: db.cancel_requested(job_id),
+            should_stop=_stop.is_set,
+            should_yield=lambda: db.higher_priority_waiting(
+                PRIORITY_RANK[job["priority"]]
+            ),
         )
 
         artifact = jdir / "model.tar.gz"
@@ -153,11 +193,29 @@ def _run_job(job: dict) -> None:
             metrics=metrics,
             artifact_bytes=artifact.stat().st_size,
         )
+        purge_checkpoint(job_id)
         log("job succeeded")
 
+    except training.Preempted:
+        # Higher-priority work is waiting. Not a failure: keep the checkpoint,
+        # keep the recorded progress, and go back to the queue. Ordering by
+        # priority means this job only resumes once nothing better is waiting.
+        log("preempted by higher-priority work; paused at its last checkpoint")
+        db.update(
+            job_id,
+            status=JobStatus.PAUSED,
+            started_at=None,
+            preempted_count=(job.get("preempted_count") or 0) + 1,
+        )
+    except training.Interrupted:
+        # Graceful shutdown, not a failure. Leave the checkpoint in place and
+        # pause so the job resumes after the restart.
+        log("service shutting down; job paused to resume from its checkpoint")
+        db.update(job_id, status=JobStatus.PAUSED, started_at=None)
     except training.Cancelled:
         log("job cancelled")
         db.update(job_id, status=JobStatus.CANCELLED, finished_at=db.now())
+        purge_checkpoint(job_id)
     except Exception as exc:
         log("job failed:\n" + traceback.format_exc())
         db.update(
@@ -166,6 +224,7 @@ def _run_job(job: dict) -> None:
             finished_at=db.now(),
             error=f"{type(exc).__name__}: {exc}"[:2000],
         )
+        purge_checkpoint(job_id)
     finally:
         # Always hand the GPU back, even if training blew up.
         if restart_needed:
@@ -194,10 +253,18 @@ def start() -> None:
     _thread.start()
 
 
-def shutdown() -> None:
+def shutdown(timeout: float = 120.0) -> None:
+    """Signal the worker to stop and wait for an in-flight job to unwind.
+
+    A running job raises Interrupted on its next step, re-queues itself and,
+    crucially, still restarts the co-tenant GPU service in its finally block.
+    The unit's TimeoutStopSec must exceed this timeout for that to complete.
+    """
     _stop.set()
     if _thread:
-        _thread.join(timeout=5)
+        _thread.join(timeout=timeout)
+        if _thread.is_alive():
+            print("worker did not stop within timeout; abandoning it", flush=True)
 
 
 def purge(job_id: str) -> None:

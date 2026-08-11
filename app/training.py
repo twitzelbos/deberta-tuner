@@ -28,8 +28,75 @@ from .schemas import JobConfig, TaskType
 IGNORE_INDEX = -100
 
 
+CHECKPOINT_FILE = "checkpoint.pt"
+
+
 class Cancelled(Exception):
     """Raised when a cancel request is observed mid-training."""
+
+
+class Interrupted(Exception):
+    """Raised when the service is shutting down and the job should resume later."""
+
+
+class Preempted(Exception):
+    """Raised at an epoch boundary when higher-priority work is waiting."""
+
+
+def _save_checkpoint(ckpt_dir: Path, model, optim, sched, epochs_completed: int,
+                     step: int, labels: list[str], log) -> None:
+    """Write a resumable checkpoint, replacing any previous one atomically."""
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+    tmp = ckpt_dir / (CHECKPOINT_FILE + ".tmp")
+    final = ckpt_dir / CHECKPOINT_FILE
+    torch.save(
+        {
+            "epochs_completed": epochs_completed,
+            "step": step,
+            "labels": labels,
+            "model": model.state_dict(),
+            "optimizer": optim.state_dict(),
+            "scheduler": sched.state_dict(),
+            "torch_rng": torch.get_rng_state(),
+        },
+        tmp,
+    )
+    # Rename is atomic within a filesystem, so a crash mid-write can never
+    # leave a truncated file where a good checkpoint used to be.
+    tmp.replace(final)
+    log(f"checkpoint saved at epoch {epochs_completed} "
+        f"({final.stat().st_size // (1 << 20)} MiB)")
+
+
+def _load_checkpoint(ckpt_dir: Path, model, optim, sched, labels: list[str], log):
+    """Restore state written by _save_checkpoint. Returns None if unusable."""
+    path = ckpt_dir / CHECKPOINT_FILE
+    if not path.exists():
+        return None
+    try:
+        # map_location='cpu' keeps the RNG state loadable; load_state_dict then
+        # copies into the already-placed model and optimizer tensors.
+        # weights_only=False is safe here: this file is written by the service
+        # into its own state directory, never supplied by a caller.
+        ckpt = torch.load(path, map_location="cpu", weights_only=False)
+    except Exception as exc:
+        log(f"checkpoint unreadable ({exc}); starting from scratch")
+        return None
+
+    if ckpt.get("labels") != labels:
+        log("checkpoint label set differs from the current data; ignoring it")
+        return None
+
+    try:
+        model.load_state_dict(ckpt["model"])
+        optim.load_state_dict(ckpt["optimizer"])
+        sched.load_state_dict(ckpt["scheduler"])
+        if ckpt.get("torch_rng") is not None:
+            torch.set_rng_state(ckpt["torch_rng"].to(torch.uint8).cpu())
+    except Exception as exc:
+        log(f"checkpoint incompatible ({exc}); starting from scratch")
+        return None
+    return ckpt
 
 
 def pick_device() -> torch.device:
@@ -210,9 +277,13 @@ def run(
     labels: list[str],
     cfg: JobConfig,
     out_dir: Path,
+    ckpt_dir: Path,
     log: Callable[[str], None],
     on_progress: Callable[[float], None],
+    on_checkpoint: Callable[[int], None],
     should_cancel: Callable[[], bool],
+    should_stop: Callable[[], bool],
+    should_yield: Callable[[], bool],
 ) -> dict[str, Any]:
     torch.manual_seed(cfg.seed)
     np.random.seed(cfg.seed)
@@ -281,16 +352,31 @@ def run(
     use_amp = device.type == "cuda"
 
     log(f"total_steps={total_steps} warmup={warmup}")
+
+    # Resume if a checkpoint from an earlier attempt is present. Granularity is
+    # a whole epoch: the interrupted epoch is redone from its start, which
+    # avoids replaying the dataloader to an exact batch.
+    start_epoch, step = 0, 0
+    resumed = _load_checkpoint(ckpt_dir, model, optim, sched, labels, log)
+    if resumed is not None:
+        start_epoch = int(resumed["epochs_completed"])
+        step = int(resumed["step"])
+        log(f"resumed from checkpoint: {start_epoch} epochs done, step {step}/{total_steps}")
+        on_progress(min(1.0, step / total_steps))
+
     model.train()
-    step = 0
     running = 0.0
     done = False
-    for epoch in range(math.ceil(cfg.epochs)):
+    for epoch in range(start_epoch, math.ceil(cfg.epochs)):
         if done:
             break
         for batch in train_loader:
             if should_cancel():
                 raise Cancelled()
+            if should_stop():
+                # Service shutting down. Unwind now; the last checkpoint is
+                # already durable and the job will be re-queued.
+                raise Interrupted()
             batch = {k: v.to(device) for k, v in batch.items()}
             with torch.autocast("cuda", dtype=torch.bfloat16, enabled=use_amp):
                 loss = model(**batch).loss
@@ -310,6 +396,25 @@ def run(
                 done = True
                 break
         log(f"epoch {epoch + 1} complete")
+
+        epochs_done = epoch + 1
+        # The epoch boundary is the only preemption point: it is where a
+        # checkpoint is coherent. A job with checkpointing disabled cannot be
+        # preempted, because there would be nothing to resume from.
+        can_checkpoint = bool(cfg.checkpoint_every_epochs) and not done
+        due = can_checkpoint and epochs_done % cfg.checkpoint_every_epochs == 0
+        yielding = can_checkpoint and should_yield()
+
+        # When `done` is set the step budget ran out mid-epoch and training is
+        # over anyway, so a checkpoint would be written only to be deleted.
+        # Yielding forces a write even off-interval, so no work is lost.
+        if due or yielding:
+            _save_checkpoint(ckpt_dir, model, optim, sched, epochs_done, step, labels, log)
+            on_checkpoint(epochs_done)
+
+        if yielding:
+            log(f"higher-priority work is waiting; yielding after epoch {epochs_done}")
+            raise Preempted()
 
     metrics: dict[str, Any] = {"train_steps": step}
     if eval_loader is not None:

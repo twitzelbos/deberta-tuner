@@ -12,8 +12,9 @@ No authentication. Anyone on the subnet can submit jobs; be considerate.
 
 ## Before you start: three things
 
-1. **Jobs run one at a time.** The server has a single GPU. Your job waits in a
-   queue behind anything already running.
+1. **Jobs run one at a time,** on a priority queue. The server has a single
+   GPU. Your job waits behind anything already running and anything of higher
+   priority. Check `GET /v1/queue` to see where you are.
 2. **Submitting a job may take another service on the same host offline.**
    Training needs the whole GPU, so the server stops any co-tenant GPU service
    for the duration of your job and restarts it afterwards. Ask your operator
@@ -149,6 +150,8 @@ Everything in `config` is optional; defaults shown:
 | `seed` | `42` | |
 | `threshold` | `0.5` | multi-label sigmoid cutoff only |
 | `name` | `null` | free-text label to find your job later |
+| `priority` | `normal` | `low`, `normal` or `high` |
+| `checkpoint_every_epochs` | `1` | `0` disables checkpointing and makes the job non-interruptible |
 
 Available `base_model` values — `GET /v1/base-models`:
 
@@ -177,6 +180,67 @@ A successful submit returns `201` and the job record with `"status": "queued"`.
 
 ---
 
+## Priority, pausing and resuming
+
+Three levels: `low`, `normal` (the default) and `high`.
+
+A `high` job does not wait for a running `normal` one to finish. At the running
+job's next **epoch boundary** it writes a checkpoint, pauses, and hands over the
+GPU. The paused job shows `status: "paused"` with the `progress` it stopped at,
+and resumes from that checkpoint once nothing higher-priority is waiting. No
+work is lost beyond the partially-completed epoch.
+
+Equal priorities never preempt each other, so two `high` jobs run one after the
+other rather than trading the GPU.
+
+Checkpointing also means a **service restart no longer kills your job** — it
+comes back as `paused` and resumes automatically.
+
+Two consequences worth knowing:
+
+- Setting `"checkpoint_every_epochs": 0` makes your job **non-interruptible**:
+  with nothing to resume from it cannot be preempted, so higher-priority work
+  waits for it. It also means a restart loses the job entirely.
+- Preemption only happens at epoch boundaries. A job with one very long epoch
+  will not yield until that epoch finishes.
+
+Use `high` sparingly — it delays everyone else.
+
+```bash
+curl -sS -X POST $HOST/v1/jobs \
+  -F 'config={"task":"sequence_classification","priority":"high","epochs":3}' \
+  -F 'train_file=@train.jsonl'
+```
+
+## Seeing the queue
+
+```bash
+curl -sS $HOST/v1/queue | jq
+```
+
+```json
+{
+  "running": {"id": "9f2c...", "priority": "normal", "progress": 0.62,
+              "elapsed_seconds": 412, "eta_seconds": 252, "yielding": false},
+  "waiting": [
+    {"position": 1, "id": "a1b2...", "status": "paused", "priority": "normal",
+     "progress": 0.4, "preempted_count": 1},
+    {"position": 2, "id": "c3d4...", "status": "queued", "priority": "low",
+     "progress": 0.0, "preempted_count": 0}
+  ],
+  "queued_count": 1, "paused_count": 1, "concurrency": 1
+}
+```
+
+`waiting` is in the exact order the server will run the jobs. `eta_seconds` is a
+straight-line guess from elapsed time and ignores evaluation, so treat it as a
+floor. `yielding: true` means the running job is about to pause for something
+more urgent.
+
+Your own job also carries `queue_position` in `GET /v1/jobs/{id}`.
+
+---
+
 ## Tracking your job
 
 ```bash
@@ -185,7 +249,9 @@ curl -sS $HOST/v1/jobs/$JOB | jq
 
 | Field | Meaning |
 |---|---|
-| `status` | `queued`, `running`, `succeeded`, `failed`, `cancelled` |
+| `status` | `queued`, `running`, `paused`, `succeeded`, `failed`, `cancelled` |
+| `queue_position` | 1-based place in the queue while waiting |
+| `preempted_count` | times higher-priority work has bumped this job |
 | `progress` | 0.0–1.0, updated every training step |
 | `metrics` | populated on success |
 | `labels` | inferred label list, in model index order |

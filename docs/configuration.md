@@ -22,6 +22,8 @@ Sent as the JSON `config` part of `POST /v1/jobs`. Every field is optional.
 | `seed` | int | `42` | — | seeds split, shuffling, init |
 | `threshold` | float | `0.5` | `>0`, `<1` | multi-label only |
 | `name` | string | `null` | — | free-text label |
+| `checkpoint_every_epochs` | int | `1` | `0`–`100` | `0` disables checkpointing *and* preemption |
+| `priority` | enum | `normal` | `low`/`normal`/`high` | higher preempts lower at an epoch boundary |
 
 Out-of-range values return `400` with the pydantic error array.
 
@@ -43,6 +45,16 @@ on everything; you then get no quality metrics.
 
 **`threshold`** — affects reported metrics and is not baked into the model. When
 serving, apply your own sigmoid cutoff.
+
+**`checkpoint_every_epochs`** — a checkpoint holds weights plus AdamW moments,
+so roughly 3x the model size on disk, replaced in place and deleted when the job
+finishes. Setting it to `0` makes a job **non-interruptible**: with nothing to
+resume from it cannot be preempted, so higher-priority work waits for it.
+
+**`priority`** — `high` jobs preempt `normal` and `low` ones at the next epoch
+boundary; the preempted job pauses and resumes once nothing higher is waiting.
+Equal priorities never preempt each other, otherwise two same-priority jobs
+would trade the GPU every epoch and neither would finish.
 
 **`base_model`** — allow-listed deliberately. An open field would let any caller
 on the subnet name an arbitrary hub repo, and model loading can execute

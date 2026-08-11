@@ -12,7 +12,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from . import config
-from .schemas import JobStatus
+from .schemas import PRIORITY_RANK, RANK_PRIORITY, JobStatus
 
 _lock = threading.Lock()
 
@@ -34,10 +34,26 @@ CREATE TABLE IF NOT EXISTS jobs (
     num_train       INTEGER,
     num_eval        INTEGER,
     artifact_bytes  INTEGER,
-    cancel_requested INTEGER NOT NULL DEFAULT 0
+    cancel_requested INTEGER NOT NULL DEFAULT 0,
+    epochs_completed INTEGER NOT NULL DEFAULT 0,
+    priority        INTEGER NOT NULL DEFAULT 1,
+    preempted_count INTEGER NOT NULL DEFAULT 0
 );
-CREATE INDEX IF NOT EXISTS jobs_status_created ON jobs(status, created_at);
+CREATE INDEX IF NOT EXISTS jobs_queue ON jobs(status, priority, created_at, id);
 """
+
+# Columns added after the first release. Applied on startup to existing files.
+_MIGRATIONS = {
+    "epochs_completed": "ALTER TABLE jobs ADD COLUMN epochs_completed INTEGER NOT NULL DEFAULT 0",
+    "priority": "ALTER TABLE jobs ADD COLUMN priority INTEGER NOT NULL DEFAULT 1",
+    "preempted_count": "ALTER TABLE jobs ADD COLUMN preempted_count INTEGER NOT NULL DEFAULT 0",
+}
+
+# Statuses eligible for the worker to claim, newest schedule first.
+_RUNNABLE = (JobStatus.QUEUED.value, JobStatus.PAUSED.value)
+# priority DESC then age ASC: higher priority always wins; ties go to whoever
+# has been waiting longest, with id as a final deterministic tiebreak.
+_QUEUE_ORDER = "ORDER BY priority DESC, created_at, id"
 
 
 def now() -> str:
@@ -55,25 +71,19 @@ def init() -> None:
     config.ensure_dirs()
     with _lock, _connect() as conn:
         conn.executescript(_SCHEMA)
-        # A job left RUNNING can only be a crash or restart mid-training; there
-        # is no process to reattach to, so surface it as failed rather than
-        # leaving it to hang in the UI forever.
-        conn.execute(
-            "UPDATE jobs SET status=?, error=?, finished_at=? WHERE status=?",
-            (
-                JobStatus.FAILED.value,
-                "service restarted while this job was running",
-                now(),
-                JobStatus.RUNNING.value,
-            ),
-        )
+        have = {r["name"] for r in conn.execute("PRAGMA table_info(jobs)")}
+        for column, ddl in _MIGRATIONS.items():
+            if column not in have:
+                conn.execute(ddl)
+    # Jobs left RUNNING are handled by worker.recover_interrupted(), which can
+    # see whether a checkpoint exists and therefore whether they can resume.
 
 
 def create(job_id: str, cfg: dict[str, Any]) -> None:
     with _lock, _connect() as conn:
         conn.execute(
-            "INSERT INTO jobs (id, name, status, task, base_model, config, created_at)"
-            " VALUES (?,?,?,?,?,?,?)",
+            "INSERT INTO jobs (id, name, status, task, base_model, config,"
+            " created_at, priority) VALUES (?,?,?,?,?,?,?,?)",
             (
                 job_id,
                 cfg.get("name"),
@@ -82,6 +92,7 @@ def create(job_id: str, cfg: dict[str, Any]) -> None:
                 cfg["base_model"],
                 json.dumps(cfg),
                 now(),
+                PRIORITY_RANK[cfg.get("priority", "normal")],
             ),
         )
 
@@ -105,6 +116,8 @@ def _row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
     for key in ("metrics", "labels"):
         d[key] = json.loads(d[key]) if d[key] else None
     d["cancel_requested"] = bool(d["cancel_requested"])
+    # Stored as an int for ordering; exposed as the API's string form.
+    d["priority"] = RANK_PRIORITY.get(d.get("priority", 1), "normal")
     return d
 
 
@@ -128,23 +141,89 @@ def list_jobs(status: str | None = None, limit: int = 100) -> list[dict[str, Any
 
 
 def claim_next() -> dict[str, Any] | None:
-    """Atomically move the oldest queued job to RUNNING and return it."""
+    """Atomically move the highest-priority waiting job to RUNNING.
+
+    Paused jobs compete on equal terms with never-started ones, so a paused
+    high-priority job outranks a fresh normal-priority one.
+    """
     with _lock, _connect() as conn:
         row = conn.execute(
-            "SELECT * FROM jobs WHERE status=? ORDER BY created_at LIMIT 1",
-            (JobStatus.QUEUED.value,),
+            f"SELECT * FROM jobs WHERE status IN (?,?) {_QUEUE_ORDER} LIMIT 1",
+            _RUNNABLE,
         ).fetchone()
         if row is None:
             return None
         cur = conn.execute(
-            "UPDATE jobs SET status=?, started_at=? WHERE id=? AND status=?",
-            (JobStatus.RUNNING.value, now(), row["id"], JobStatus.QUEUED.value),
+            "UPDATE jobs SET status=?, started_at=? WHERE id=? AND status IN (?,?)",
+            (JobStatus.RUNNING.value, now(), row["id"], *_RUNNABLE),
         )
         if cur.rowcount != 1:
             return None
         job = _row_to_dict(row)
     job["status"] = JobStatus.RUNNING.value
     return job
+
+
+def waiting_jobs() -> list[dict[str, Any]]:
+    """Queued and paused jobs, in the order the worker will run them."""
+    with _lock, _connect() as conn:
+        rows = conn.execute(
+            f"SELECT * FROM jobs WHERE status IN (?,?) {_QUEUE_ORDER}", _RUNNABLE
+        ).fetchall()
+    return [_row_to_dict(r) for r in rows]
+
+
+def higher_priority_waiting(rank: int) -> bool:
+    """Is strictly higher-priority work waiting?
+
+    Strictly, so equal-priority jobs never preempt each other -- otherwise two
+    same-priority jobs would trade the GPU at every epoch and neither finish.
+    """
+    with _lock, _connect() as conn:
+        row = conn.execute(
+            "SELECT 1 FROM jobs WHERE status IN (?,?) AND priority > ? LIMIT 1",
+            (*_RUNNABLE, rank),
+        ).fetchone()
+    return row is not None
+
+
+def running_job() -> dict[str, Any] | None:
+    """The job currently training, if any. At most one: the worker is serial."""
+    with _lock, _connect() as conn:
+        row = conn.execute(
+            "SELECT * FROM jobs WHERE status=? ORDER BY started_at LIMIT 1",
+            (JobStatus.RUNNING.value,),
+        ).fetchone()
+    return _row_to_dict(row) if row else None
+
+
+def queue_position(job_id: str) -> int | None:
+    """1-based position among waiting jobs, or None if not waiting."""
+    with _lock, _connect() as conn:
+        row = conn.execute(
+            "SELECT created_at, priority FROM jobs WHERE id=? AND status IN (?,?)",
+            (job_id, *_RUNNABLE),
+        ).fetchone()
+        if row is None:
+            return None
+        # Mirrors _QUEUE_ORDER: strictly higher priority is ahead, and within
+        # the same priority, anything older is ahead.
+        ahead = conn.execute(
+            "SELECT COUNT(*) AS n FROM jobs WHERE status IN (?,?) AND ("
+            "  priority > ? OR (priority = ? AND (created_at, id) < (?, ?))"
+            ")",
+            (*_RUNNABLE, row["priority"], row["priority"], row["created_at"], job_id),
+        ).fetchone()["n"]
+    return ahead + 1
+
+
+def interrupted_jobs() -> list[dict[str, Any]]:
+    """Rows still marked RUNNING, i.e. orphaned by a crash or restart."""
+    with _lock, _connect() as conn:
+        rows = conn.execute(
+            "SELECT * FROM jobs WHERE status=?", (JobStatus.RUNNING.value,)
+        ).fetchall()
+    return [_row_to_dict(r) for r in rows]
 
 
 def request_cancel(job_id: str) -> None:
