@@ -72,8 +72,37 @@ say "4/7 syncing the venv at ${PREFIX}/.venv from uv.lock"
 # --no-dev: skip the dev group (httpx, needed only by the test suite).
 # -H: without it sudo keeps root's HOME and uv writes its cache to /root/.cache
 #   as the service user, which fails.
-sudo -u "$SVC_USER" -H /usr/local/bin/uv sync \
-    --locked --no-dev --python 3.12 --project "$PREFIX"
+sync_venv() {
+    sudo -u "$SVC_USER" -H /usr/local/bin/uv sync \
+        --locked --no-dev --python 3.12 --project "$PREFIX"
+}
+
+# An interrupted or concurrent sync can leave a wheel half-extracted while its
+# dist-info still records it as installed. A later `uv sync` then sees nothing
+# to do, and the service crashloops on ModuleNotFoundError at startup. The only
+# reliable check is to import the real thing.
+verify_venv() {
+    sudo -u "$SVC_USER" -H sh -c \
+        "cd '$PREFIX' && '$PREFIX/.venv/bin/python' -c 'import torch, transformers, app.main'" \
+        >/dev/null 2>&1
+}
+
+sync_venv
+if ! verify_venv; then
+    echo "  venv does not import; rebuilding it from scratch" >&2
+    [ -n "$PREFIX" ] && rm -rf "${PREFIX:?}/.venv"
+    # The cached wheel may itself be truncated, in which case a plain rebuild
+    # would reproduce the same corruption. Costs a re-download; worth it.
+    sudo -u "$SVC_USER" -H /usr/local/bin/uv cache clean >/dev/null 2>&1 || true
+    sync_venv
+    verify_venv || {
+        echo "  venv still does not import after a clean rebuild; aborting" >&2
+        sudo -u "$SVC_USER" -H sh -c \
+            "cd '$PREFIX' && '$PREFIX/.venv/bin/python' -c 'import torch, transformers, app.main'" >&2
+        exit 1
+    }
+fi
+echo "  venv imports cleanly"
 
 say "5/7 installing the sudoers grant for sglang control"
 # Validate before installing: a malformed sudoers file can lock out sudo.
