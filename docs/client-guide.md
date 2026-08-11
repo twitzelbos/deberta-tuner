@@ -78,7 +78,7 @@ Needs at least 2 distinct labels. Add `"text_pair"` for sentence-pair tasks
 {"text": "A man plays guitar.", "text_pair": "Someone plays an instrument.", "label": "entailment"}
 ```
 
-Reports `accuracy`, `f1_macro`.
+Reports `accuracy`, `f1_macro` and `roc_auc`.
 
 ### `multi_label_classification` — zero or more labels per text
 
@@ -87,7 +87,7 @@ Reports `accuracy`, `f1_macro`.
 {"text": "no strong opinion", "labels": []}
 ```
 
-Empty list is valid. Reports `f1_micro`, `f1_macro`, `subset_accuracy`.
+Empty list is valid. Reports `f1_micro`, `f1_macro`, `subset_accuracy` and `roc_auc_macro`.
 
 ### `token_classification` — a label per word (NER)
 
@@ -307,6 +307,21 @@ it takes effect within seconds:
 ```bash
 curl -sS -X POST $HOST/v1/jobs/$JOB/cancel
 ```
+
+### Which metric to trust
+
+`accuracy` and `f1_macro` describe **one operating point** — the labels you get
+after cutting the score at 0.5. `roc_auc` is **threshold-free**: it measures how
+well the model ranks positives above negatives across every possible cutoff.
+
+If you intend to pick your own threshold — as you would for a gate or a filter —
+`roc_auc` is the number to compare between runs. A model can rank perfectly and
+still score 0.5 accuracy if every prediction sits on one side of the default
+cutoff.
+
+For binary tasks the positive class is label index 1, the **alphabetically
+later** of your two labels. It is omitted entirely when a class is missing from
+the holdout, since it is undefined there.
 
 ---
 

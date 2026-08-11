@@ -264,13 +264,18 @@ Everything in `JobSummary`, plus:
 
 | Task | Keys |
 |---|---|
-| `sequence_classification` | `accuracy`, `f1_macro` |
-| `multi_label_classification` | `f1_micro`, `f1_macro`, `subset_accuracy` |
+| `sequence_classification` | `accuracy`, `f1_macro`, `roc_auc` |
+| `multi_label_classification` | `f1_micro`, `f1_macro`, `subset_accuracy`, `roc_auc_macro` |
 | `token_classification` | `precision`, `recall`, `f1` (entity-level, seqeval) |
 | `regression` | `mse`, `mae`, `pearson` (omitted if either side is constant) |
 
 `train_steps` is always present. With `eval_split: 0` and no `eval_file`, it is
 the only key.
+
+`roc_auc` is **omitted rather than reported as null** when it is undefined —
+which happens whenever a class is absent from the evaluation set. For binary
+tasks the positive class is label index 1, i.e. the alphabetically later
+label.
 
 ### Status values
 

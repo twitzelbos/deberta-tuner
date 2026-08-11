@@ -253,6 +253,48 @@ def _make_collate(tok, task: TaskType) -> Callable:
 # --------------------------------------------------------------------------- #
 
 
+def _softmax(x: np.ndarray) -> np.ndarray:
+    e = np.exp(x - x.max(axis=-1, keepdims=True))
+    return e / e.sum(axis=-1, keepdims=True)
+
+
+def _roc_auc(task: TaskType, logits: np.ndarray, gold: np.ndarray) -> float | None:
+    """Threshold-free ranking quality, or None when it is undefined.
+
+    Accuracy and F1 describe one operating point; AUC describes the whole
+    curve, which is what matters for a score you intend to threshold yourself.
+    Undefined whenever a class is absent from the evaluation set -- common with
+    small or imbalanced holdouts -- so it is omitted rather than faked.
+    """
+    import warnings
+
+    from sklearn.metrics import roc_auc_score
+
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            if task is TaskType.MULTI_LABEL_CLASSIFICATION:
+                prob = 1.0 / (1.0 + np.exp(-logits))
+                value = roc_auc_score(gold, prob, average="macro")
+            elif logits.shape[-1] == 2:
+                # Positive class is index 1, the alphabetically later label.
+                value = roc_auc_score(gold, _softmax(logits)[:, 1])
+            else:
+                value = roc_auc_score(
+                    gold, _softmax(logits), multi_class="ovr", average="macro"
+                )
+    except ValueError:
+        return None
+
+    # sklearn does not always raise on a degenerate holdout: with one class
+    # present it warns and returns NaN. That would serialise as bare `NaN`,
+    # which is invalid JSON and breaks strict clients, so drop it instead.
+    value = float(value)
+    if not math.isfinite(value):
+        return None
+    return value
+
+
 def _metrics(task: TaskType, logits: np.ndarray, gold: np.ndarray,
              labels: list[str], threshold: float) -> dict[str, float]:
     from sklearn.metrics import accuracy_score, f1_score
@@ -272,11 +314,15 @@ def _metrics(task: TaskType, logits: np.ndarray, gold: np.ndarray,
     if task is TaskType.MULTI_LABEL_CLASSIFICATION:
         prob = 1.0 / (1.0 + np.exp(-logits))
         pred = (prob >= threshold).astype(int)
-        return {
+        out = {
             "f1_micro": float(f1_score(gold, pred, average="micro", zero_division=0)),
             "f1_macro": float(f1_score(gold, pred, average="macro", zero_division=0)),
             "subset_accuracy": float((pred == gold).all(axis=1).mean()),
         }
+        auc = _roc_auc(task, logits, gold)
+        if auc is not None:
+            out["roc_auc_macro"] = auc
+        return out
 
     if task is TaskType.TOKEN_CLASSIFICATION:
         from seqeval.metrics import f1_score as seq_f1
@@ -295,10 +341,16 @@ def _metrics(task: TaskType, logits: np.ndarray, gold: np.ndarray,
         }
 
     pred = logits.argmax(-1)
-    return {
+    out = {
         "accuracy": float(accuracy_score(gold, pred)),
         "f1_macro": float(f1_score(gold, pred, average="macro", zero_division=0)),
     }
+    auc = _roc_auc(task, logits, gold)
+    if auc is not None:
+        # Binary: ranking of the positive class (label index 1). Multiclass:
+        # macro one-vs-rest.
+        out["roc_auc"] = auc
+    return out
 
 
 # --------------------------------------------------------------------------- #

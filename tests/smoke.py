@@ -116,9 +116,58 @@ def test_validation_errors() -> None:
     print("PASS validation")
 
 
+def test_roc_auc() -> None:
+    """AUC is threshold-free, so it is asserted against crafted scores."""
+    import numpy as np
+
+    print(f"\n{'=' * 60}\nroc_auc\n{'=' * 60}", flush=True)
+
+    # Perfectly separable binary scores -> AUC 1.0, regardless of threshold.
+    logits = np.array([[3.0, -3.0]] * 4 + [[-3.0, 3.0]] * 4)
+    gold = np.array([0, 0, 0, 0, 1, 1, 1, 1])
+    m = training._metrics(TaskType.SEQUENCE_CLASSIFICATION, logits, gold, ["a", "b"], 0.5)
+    assert m["roc_auc"] == 1.0, m
+    print(f"  ok: separable -> roc_auc={m['roc_auc']}")
+
+    # Exactly inverted ranking -> 0.0, while accuracy also collapses.
+    m = training._metrics(TaskType.SEQUENCE_CLASSIFICATION, logits, 1 - gold, ["a", "b"], 0.5)
+    assert m["roc_auc"] == 0.0, m
+    print(f"  ok: inverted  -> roc_auc={m['roc_auc']}")
+
+    # AUC sees ranking that accuracy at 0.5 cannot: all predictions land on one
+    # side of the threshold, yet the positives are ranked above the negatives.
+    skew = np.array([[2.0, -1.0], [2.0, -0.9], [2.0, -0.8], [2.0, -0.7]])
+    m = training._metrics(TaskType.SEQUENCE_CLASSIFICATION, skew,
+                          np.array([0, 0, 1, 1]), ["a", "b"], 0.5)
+    assert m["accuracy"] == 0.5 and m["roc_auc"] == 1.0, m
+    print(f"  ok: accuracy={m['accuracy']} but roc_auc={m['roc_auc']}")
+
+    # Undefined with a single class present: omitted rather than faked.
+    m = training._metrics(TaskType.SEQUENCE_CLASSIFICATION, logits,
+                          np.zeros(8, dtype=int), ["a", "b"], 0.5)
+    assert "roc_auc" not in m, m
+    print("  ok: single-class holdout -> roc_auc omitted")
+
+    # Multi-label reports a macro AUC over the label columns.
+    ml_logits = np.array([[3.0, -3.0], [-3.0, 3.0], [3.0, -3.0], [-3.0, 3.0]])
+    ml_gold = np.array([[1, 0], [0, 1], [1, 0], [0, 1]])
+    m = training._metrics(TaskType.MULTI_LABEL_CLASSIFICATION, ml_logits, ml_gold,
+                          ["x", "y"], 0.5)
+    assert m["roc_auc_macro"] == 1.0, m
+    print(f"  ok: multi-label -> roc_auc_macro={m['roc_auc_macro']}")
+
+    # Regression has no notion of ranking classes.
+    m = training._metrics(TaskType.REGRESSION, np.array([[1.0], [2.0]]),
+                          np.array([1.0, 2.0]), [], 0.5)
+    assert "roc_auc" not in m, m
+    print("  ok: regression -> no roc_auc")
+    print("PASS roc_auc")
+
+
 def main() -> int:
     workdir = Path(_TMP)
     test_validation_errors()
+    test_roc_auc()
     results = {t.value: run_task(t, workdir) for t in TaskType}
     print(f"\n{'=' * 60}\nALL PASSED\n{'=' * 60}")
     print(json.dumps(results, indent=2))
