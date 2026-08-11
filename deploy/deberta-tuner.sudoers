@@ -1,0 +1,7 @@
+# Installed to /etc/sudoers.d/deberta-tuner (mode 0440).
+#
+# The tuning service owns the GPU for the duration of a job, so it stops the
+# SGLang server and restarts it afterwards. This grant is deliberately narrow:
+# two exact commands, no wildcards, no shell.
+deberta ALL=(root) NOPASSWD: /usr/bin/systemctl stop sglang.service
+deberta ALL=(root) NOPASSWD: /usr/bin/systemctl start sglang.service
