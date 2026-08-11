@@ -12,6 +12,7 @@ never leaves the co-tenant down.
 """
 from __future__ import annotations
 
+import gc
 import json
 import shutil
 import subprocess
@@ -128,6 +129,31 @@ def _start_cotenant(log) -> None:
     _systemctl("start", log)
 
 
+def _free_torch_memory(log) -> None:
+    """Return cached CUDA blocks to the driver.
+
+    Training runs in this process, and PyTorch's caching allocator keeps freed
+    blocks reserved for the lifetime of the process -- `del` alone releases
+    nothing to the driver. Several GB therefore stay held after a job, which is
+    enough to stop the co-tenant service from allocating its own share and make
+    it fail to start. Only the ~455 MiB CUDA context remains after this.
+    """
+    try:
+        import torch
+
+        if not torch.cuda.is_available():
+            return
+        before = gpu_free_mib(log)
+        torch.cuda.synchronize()
+        gc.collect()
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
+        after = gpu_free_mib(log)
+        log(f"released cached GPU memory: {before} -> {after} MiB free")
+    except Exception as exc:
+        log(f"could not release cached GPU memory: {exc}")
+
+
 def gpu_free_mib(log) -> int:
     try:
         r = subprocess.run(
@@ -241,8 +267,11 @@ def _run_job(job: dict) -> None:
         )
         purge_checkpoint(job_id)
     finally:
-        # The GPU is handed back by the drain loop, not here: another job may
-        # be waiting and would only have to stop the co-tenant again.
+        # Hand cached VRAM back even though the process stays alive, so the
+        # next job -- or the co-tenant, once the queue drains -- can use it.
+        _free_torch_memory(log)
+        # The co-tenant is restarted by the drain loop, not here: another job
+        # may be waiting and would only have to stop it again.
         log_file.close()
 
 
@@ -273,6 +302,13 @@ def _loop() -> None:
                         f"{config.GPU_IDLE_RESTART_SECONDS}s unless work arrives"
                     )
                 elif time.monotonic() - idle_since >= config.GPU_IDLE_RESTART_SECONDS:
+                    # Belt and braces. Each job already frees its cache in a
+                    # finally, but this is the one moment where holding VRAM
+                    # actually breaks something, and it costs ~27 ms once per
+                    # busy period. Also covers anything that allocated outside
+                    # a job.
+                    _free_torch_memory(_svc_log)
+                    _svc_log(f"restarting the co-tenant; {gpu_free_mib(_svc_log)} MiB free")
                     _start_cotenant(_svc_log)
                     holding = False
                     idle_since = None

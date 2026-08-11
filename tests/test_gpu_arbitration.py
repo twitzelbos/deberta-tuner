@@ -53,8 +53,12 @@ def install_stubs() -> None:
         (out / "config.json").write_text("{}")
         return {"train_steps": 1, "accuracy": 1.0}
 
+    def free_mem(_log):
+        events.append("free")
+
     worker._stop_cotenant = stop
     worker._start_cotenant = start
+    worker._free_torch_memory = free_mem
     worker.gpu_free_mib = lambda _log: 23_000
     worker.training.run = fake_train
 
@@ -107,6 +111,10 @@ def main() -> int:
             60, "all three jobs to finish",
         )
         check("all three ran", events.count("train") == 3, str(events))
+        check("cached VRAM released after every job",
+              events.count("free") == 3,
+              "PyTorch caches freed blocks; without this the co-tenant cannot "
+              f"reallocate. events={events}")
         check("co-tenant stopped exactly once", events.count("stop") == 1, str(events))
         check("not restarted between jobs", events.count("start") == 0, str(events))
         check("stop came first", events[0] == "stop", str(events))
@@ -133,8 +141,8 @@ def main() -> int:
         submit("e")
         wait_until(lambda: statuses().get("e") == JobStatus.SUCCEEDED.value, 60, "job e")
         check("stopped again for new work", events.count("stop") == 2, str(events))
-        check("ordering is stop,start,...,stop",
-              events[-2:] == ["stop", "train"], str(events[-4:]))
+        check("re-acquire then train then free",
+              events[-3:] == ["stop", "train", "free"], str(events[-5:]))
     finally:
         worker.shutdown(timeout=30)
 
